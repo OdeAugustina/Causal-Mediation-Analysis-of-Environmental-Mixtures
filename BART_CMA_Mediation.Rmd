@@ -1,0 +1,358 @@
+---
+title: "BART-CMA Applied Mediation: Mixture → DII → Liver Markers"
+author: "Augustina"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+params:
+  profile: "test"                       # "test" (RStudio) or "production" (SLURM batch render)
+  data_xlsx: "completed_liver_pfas_ALL.xlsx"
+  confounder_set: "primary"             # "primary" (recommended) or "sensitivity" (over-adjusted)
+  log_outcomes: true
+  weight_col: "PFASWeight"              # NULL/"" for an unweighted sample-level analysis
+  n_cores: 1                            # >1 only in a batch job, never in interactive RStudio
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      cache = FALSE, fig.width = 9, fig.height = 6)
+
+## Allows running chunks interactively (no knit) without a params object.
+if (!exists("params")) {
+  params <- list(profile = "test",
+                 data_xlsx = "completed_liver_pfas_ALL.xlsx",
+                 confounder_set = "primary", log_outcomes = TRUE,
+                 weight_col = "PFASWeight", n_cores = 1)
+}
+```
+
+# 1. Packages
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(BART)        # wbart / pbart
+  library(readxl)      # read the 20 imputation sheets
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(writexl)
+  library(parallel)    # mclapply for the batch (production) run
+})
+```
+
+# 2. Configuration
+
+Everything that defines the analysis lives here. The **only scientific choice
+you must own is the confounder set** (see the note below).
+
+```{r config}
+CFG <- list(
+  exposure_cols = c("log_Lead", "log_Cadmium", "log_Mercury",
+                    "log_PFOA", "log_PFOS"),
+  mediator_col  = "DII",
+  outcome_cols  = c("LiverFibrosis", "LiverFat", "ALT", "AST",
+                    "AlkPhosphatase", "GGT"),
+  outcome_type  = "continuous",          # all six are continuous here
+  weight_col    = if (is.null(params$weight_col) || params$weight_col == "")
+                    NULL else params$weight_col,
+  log_outcomes  = isTRUE(params$log_outcomes),
+
+  ## PRIMARY = pre-exposure common causes only. Drops CRP, HbA1c, lipids, BP,
+  ## waist — these sit DOWNSTREAM of DII/exposures (mediators/colliders), and
+  ## conditioning on them biases NIE toward 0.
+  confounders_primary = c("Age", "BMI", "Gender_Male", "Race_NHWhite",
+                          "Education", "Income", "Smoker", "Drinker"),
+  ## SENSITIVITY = your original over-adjusted set; report alongside PRIMARY.
+  confounders_sensitivity = c("Age", "BMI", "Gender_Male", "Race_NHWhite",
+                              "Education", "Income", "Smoker", "Drinker",
+                              "WaistCircumference", "CRP", "HbA1c",
+                              "TotalCholesterol", "HDLCholesterol",
+                              "SystolicBloodPressure", "DiastolicBloodPressure")
+)
+CFG$confounder_cols <- if (params$confounder_set == "sensitivity")
+  CFG$confounders_sensitivity else CFG$confounders_primary
+
+## ---- profile: test (RStudio dev) vs production (SLURM batch) ---------------
+if (params$profile == "production") {
+  RUN <- list(outcomes = CFG$outcome_cols, n_imp = 20,
+              n_tree = 200, n_burn = 2000, n_post = 2000, n_med = 30)
+} else {
+  RUN <- list(outcomes = c("ALT"), n_imp = 3,        # light, finishes in minutes
+              n_tree = 50, n_burn = 500, n_post = 500, n_med = 10)
+}
+
+cat("Profile        :", params$profile, "\n")
+cat("Outcomes       :", paste(RUN$outcomes, collapse = ", "), "\n")
+cat("Imputations    :", RUN$n_imp, "\n")
+cat("Confounder set :", params$confounder_set,
+    "(", length(CFG$confounder_cols), "vars )\n")
+cat("Weighted       :", !is.null(CFG$weight_col),
+    if (!is.null(CFG$weight_col)) paste0("(", CFG$weight_col, ")") else "", "\n")
+cat("Log outcomes   :", CFG$log_outcomes, "\n")
+cat("Total fits     :", length(RUN$outcomes) * RUN$n_imp, "\n")
+```
+
+> **Confounder decision.** Defaulting to `primary`. CRP is downstream systemic
+> inflammation on the DII→liver path; conditioning on it deflates the very NIE
+> you're estimating. Run `sensitivity` too and report both — if NIE shrinks
+> under the over-adjusted set, that's evidence of pathway over-adjustment.
+
+# 3. Load imputed datasets (20 sheets → list)
+
+```{r load-data}
+sheets <- excel_sheets(params$data_xlsx)
+sheets <- sheets[grepl("^Imputation_", sheets)]
+completed_list <- lapply(sheets, function(sh)
+  as.data.frame(read_excel(params$data_xlsx, sheet = sh)))
+names(completed_list) <- sheets
+
+cat("Loaded", length(completed_list), "imputed datasets:",
+    nrow(completed_list[[1]]), "rows x", ncol(completed_list[[1]]), "cols.\n")
+
+## column check
+need <- c(CFG$exposure_cols, CFG$mediator_col, RUN$outcomes,
+          CFG$confounder_cols, CFG$weight_col)
+miss <- setdiff(need, colnames(completed_list[[1]]))
+if (length(miss)) { cat("MISSING columns:\n"); print(miss) } else
+  cat("All required columns present.\n")
+```
+
+# 4. BART-CMA estimator (Devick 2022 framework)
+
+Corrected vs. the earlier n200 version: `predict()` is out of the posterior
+loop (≈50–200× faster), `sigma` is read from the post-burn-in draws, survey
+weights enter via a weighted population average, and there's a `pbart` branch
+for binary outcomes (unused here, kept for reuse).
+
+```{r bart-cma-function}
+bart_cma_mixture <- function(Z, M, Y, X, weights = NULL,
+                             q_low = 0.25, q_high = 0.75,
+                             outcome_type = c("continuous", "binary"),
+                             n_tree = 200, n_burn = 2000, n_post = 2000,
+                             n_med_draws = 30, seed = 2025) {
+  outcome_type <- match.arg(outcome_type)
+  set.seed(seed)
+  n <- length(Y); S <- n_post
+
+  if (is.null(weights)) weights <- rep(1, n)
+  weights <- as.numeric(weights); wsum <- sum(weights)
+  wavg <- function(mat) as.numeric(mat %*% weights) / wsum
+
+  Z <- as.matrix(Z); X <- as.matrix(X)
+  Z_low  <- apply(Z, 2, quantile, probs = q_low,  na.rm = TRUE)
+  Z_high <- apply(Z, 2, quantile, probs = q_high, na.rm = TRUE)
+  Z_at_low  <- matrix(rep(Z_low,  each = n), nrow = n); colnames(Z_at_low)  <- colnames(Z)
+  Z_at_high <- matrix(rep(Z_high, each = n), nrow = n); colnames(Z_at_high) <- colnames(Z)
+
+  ## Step 1: mediator model E[M | Z, X]
+  mfit <- wbart(x.train = cbind(Z, X), y.train = M,
+                ntree = n_tree, nskip = n_burn, ndpost = n_post,
+                printevery = n_burn + n_post + 1L)
+  M_low_hat  <- predict(mfit, newdata = cbind(Z_at_low,  X))
+  M_high_hat <- predict(mfit, newdata = cbind(Z_at_high, X))
+  L <- length(mfit$sigma)
+  sig <- mfit$sigma[(L - n_post + 1):L]          # POST-burn-in residual SDs
+
+  ## Step 2: outcome model E[Y | Z, M, X]
+  if (outcome_type == "continuous") {
+    ofit <- wbart(x.train = cbind(Z, M, X), y.train = Y,
+                  ntree = n_tree, nskip = n_burn, ndpost = n_post,
+                  printevery = n_burn + n_post + 1L)
+    predict_Y <- function(nd) predict(ofit, newdata = nd)
+  } else {
+    ofit <- pbart(x.train = cbind(Z, M, X), y.train = Y,
+                  ntree = n_tree, nskip = n_burn, ndpost = n_post,
+                  printevery = n_burn + n_post + 1L)
+    predict_Y <- function(nd) predict(ofit, newdata = nd)$prob.test
+  }
+
+  ## Step 3: paired-draw Monte-Carlo g-computation
+  ## Mediator draw s is paired with outcome draw s; residual realisations
+  ## are averaged within the draw. The previous version drew one mediator
+  ## index per k and shared it across all S rows, which averaged mediator
+  ## uncertainty out of the posterior and produced intervals that were too
+  ## narrow. Survey weighting (wavg) is unchanged.
+  S_use   <- min(S, 200L)
+  idx     <- if (S_use < S) round(seq(1, S, length.out = S_use)) else seq_len(S)
+  n_med_paired <- 5L
+
+  Y_hh <- Y_ll <- Y_hl <- matrix(NA_real_, length(idx), n)
+  ridx  <- rep(seq_len(n), n_med_paired)
+  Zh_r  <- Z_at_high[ridx, , drop = FALSE]
+  Zl_r  <- Z_at_low[ridx,  , drop = FALSE]
+  X_r   <- X[ridx, , drop = FALSE]
+  B     <- n_med_paired * n
+  cm    <- function(v) colMeans(matrix(v, n_med_paired, n, byrow = TRUE))
+
+  for (j in seq_along(idx)) {
+    sdx    <- idx[j]
+    m_low  <- as.vector(t(matrix(M_low_hat[sdx, ],  n_med_paired, n, byrow = TRUE) +
+                          matrix(rnorm(B, 0, sig[sdx]), n_med_paired, n)))
+    m_high <- as.vector(t(matrix(M_high_hat[sdx, ], n_med_paired, n, byrow = TRUE) +
+                          matrix(rnorm(B, 0, sig[sdx]), n_med_paired, n)))
+    Y_hh[j, ] <- cm(predict_Y(cbind(Zh_r, M = m_high, X_r))[sdx, ])
+    Y_ll[j, ] <- cm(predict_Y(cbind(Zl_r, M = m_low,  X_r))[sdx, ])
+    Y_hl[j, ] <- cm(predict_Y(cbind(Zh_r, M = m_low,  X_r))[sdx, ])
+  }
+
+  TE  <- wavg(Y_hh) - wavg(Y_ll)
+  NDE <- wavg(Y_hl) - wavg(Y_ll)
+  NIE <- wavg(Y_hh) - wavg(Y_hl)
+  PM  <- ifelse(abs(TE) > 1e-8, NIE / TE, NA_real_)
+  list(TE_draws = TE, NDE_draws = NDE, NIE_draws = NIE, PM_draws = PM)
+}
+```
+
+# 5. Run all (outcome × imputation) cells
+
+```{r run, results='hold'}
+## build the task grid
+grid <- expand.grid(outcome = RUN$outcomes, imp = seq_len(RUN$n_imp),
+                    stringsAsFactors = FALSE)
+
+run_cell <- function(i) {
+  outcome <- grid$outcome[i]; imp <- grid$imp[i]
+  d <- completed_list[[imp]]
+  num <- function(df) {
+    df <- as.data.frame(df)
+    df[] <- lapply(df, function(col)
+      if (is.numeric(col)) col else as.numeric(as.character(col)))
+    as.matrix(df)
+  }
+  Z <- num(d[, CFG$exposure_cols, drop = FALSE])
+  M <- as.numeric(as.character(d[[CFG$mediator_col]]))
+  Y <- as.numeric(as.character(d[[outcome]]))
+  if (CFG$log_outcomes) { stopifnot(all(Y > 0)); Y <- log(Y) }
+  conf <- intersect(CFG$confounder_cols, colnames(d))
+  X <- num(d[, conf, drop = FALSE])
+  w <- if (!is.null(CFG$weight_col)) d[[CFG$weight_col]] else NULL
+  res <- bart_cma_mixture(Z, M, Y, X, weights = w,
+                          outcome_type = CFG$outcome_type,
+                          n_tree = RUN$n_tree, n_burn = RUN$n_burn,
+                          n_post = RUN$n_post, n_med_draws = RUN$n_med,
+                          seed = 2025 + i)
+  list(outcome = outcome, imp = imp, result = res)
+}
+
+t0 <- Sys.time()
+if (params$n_cores > 1) {
+  cells <- mclapply(seq_len(nrow(grid)), run_cell, mc.cores = params$n_cores)
+} else {
+  cells <- lapply(seq_len(nrow(grid)), function(i) {
+    cat(sprintf("[%d/%d] %s imp %d\n", i, nrow(grid),
+                grid$outcome[i], grid$imp[i])); run_cell(i)
+  })
+}
+cat("Total runtime:",
+    round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), "min\n")
+```
+
+# 6. Pool posteriors across imputations
+
+Mixture-of-posteriors pooling: concatenate the per-imputation posterior draws
+of each estimand, then take quantiles — this propagates both imputation and
+posterior uncertainty.
+
+```{r pool}
+summ <- function(d, outcome, name) {
+  d <- d[is.finite(d)]
+  data.frame(outcome = outcome, estimand = name,
+             mean = mean(d), sd = sd(d),
+             lower = unname(quantile(d, 0.025)),
+             upper = unname(quantile(d, 0.975)),
+             prob_pos = mean(d > 0), row.names = NULL)
+}
+
+pooled <- lapply(unique(grid$outcome), function(oc) {
+  these <- Filter(function(x) x$outcome == oc, cells)
+  grab <- function(nm) unlist(lapply(these, function(x) x$result[[nm]]))
+  bind_rows(summ(grab("TE_draws"),  oc, "TE"),
+            summ(grab("NDE_draws"), oc, "NDE"),
+            summ(grab("NIE_draws"), oc, "NIE"),
+            summ(grab("PM_draws"),  oc, "PM"))
+})
+results_table <- bind_rows(pooled)
+```
+
+# 7. Results table
+
+```{r results-table}
+scale_note <- if (CFG$log_outcomes) " (log scale)" else ""
+cat("Mixture: Lead, Cadmium, Mercury, PFOA, PFOS (25th→75th pctl)",
+    scale_note, "\nMediator: DII | Confounders:", params$confounder_set,
+    "| Weighted:", !is.null(CFG$weight_col), "\n\n")
+
+results_table %>%
+  mutate(across(c(mean, sd, lower, upper), ~round(., 4)),
+         prob_pos = round(prob_pos, 3),
+         CI = paste0("[", lower, ", ", upper, "]")) %>%
+  select(outcome, estimand, mean, sd, CI, prob_pos) %>%
+  as.data.frame() %>% print.data.frame(row.names = FALSE)
+```
+
+# 8. Forest plot — NIE
+
+```{r forest-nie, fig.height=5}
+nie <- results_table %>% filter(estimand == "NIE")
+ggplot(nie, aes(mean, reorder(outcome, mean))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = .2, linewidth = .8) +
+  geom_point(size = 3, color = "darkblue") +
+  labs(title = "Natural Indirect Effect (NIE) through DII",
+       subtitle = paste0("Mixture 25th→75th pctl shift", scale_note),
+       x = "NIE", y = NULL) +
+  theme_minimal(base_size = 13) + theme(plot.title = element_text(face = "bold"))
+```
+
+# 9. Forest plot — TE
+
+```{r forest-te, fig.height=5}
+te <- results_table %>% filter(estimand == "TE")
+ggplot(te, aes(mean, reorder(outcome, mean))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = .2, linewidth = .8) +
+  geom_point(size = 3, color = "darkred") +
+  labs(title = "Total Effect (TE) of mixture on liver markers",
+       subtitle = paste0("Mixture 25th→75th pctl shift", scale_note),
+       x = "TE", y = NULL) +
+  theme_minimal(base_size = 13) + theme(plot.title = element_text(face = "bold"))
+```
+
+# 10. Proportion mediated
+
+```{r pm, fig.height=5}
+pm <- results_table %>% filter(estimand == "PM") %>% mutate(pct = mean * 100)
+ggplot(pm, aes(reorder(outcome, pct), pct)) +
+  geom_col(fill = "steelblue", alpha = .8) +
+  geom_text(aes(label = paste0(round(pct, 1), "%")), hjust = -0.2, size = 4) +
+  coord_flip() +
+  labs(title = "Proportion mediated through DII", x = NULL, y = "% mediated") +
+  theme_minimal(base_size = 13) + theme(plot.title = element_text(face = "bold")) +
+  ylim(min(pm$pct) - 5, max(pm$pct) + 12)
+```
+
+# 11. Save outputs
+
+```{r save}
+dir.create("output", showWarnings = FALSE)
+tag <- paste0(params$profile, "_", params$confounder_set)
+saveRDS(cells,          file.path("output", paste0("bart_cma_cells_", tag, ".rds")))
+saveRDS(results_table,  file.path("output", paste0("bart_cma_pooled_", tag, ".rds")))
+write_xlsx(results_table, file.path("output", paste0("bart_cma_pooled_", tag, ".xlsx")))
+cat("Saved to output/ with tag:", tag, "\n")
+```
+
+---
+
+### How this Rmd is meant to be run
+
+- **In RStudio Server (development):** keep `profile: test`. Knit or run chunks;
+  finishes in a few minutes on 1 outcome × 3 imputations at reduced settings.
+- **Full run (production):** do **not** knit this interactively. Render it as a
+  batch job (see the accompanying instructions) with
+  `params = list(profile = "production", n_cores = 10)`.

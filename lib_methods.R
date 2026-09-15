@@ -127,7 +127,7 @@ set.seed(as.integer(SIM_CONFIG$seed + scenario$scenario_id * 1000L + rep_id))
   dat <- generate_data(scenario)
   results <- list()
   if ("BKMR-CMA" %in% methods_to_run) {
-    t0 <- proc.time(); r <- run_bkmr_cma(dat, truth)
+    dat$rep_id <- rep_id; t0 <- proc.time(); r <- run_bkmr_cma(dat, truth)
     r$runtime <- (proc.time() - t0)[3]; results[["BKMR-CMA"]] <- r
   }
   if ("BART-CMA" %in% methods_to_run) {
@@ -139,25 +139,63 @@ set.seed(as.integer(SIM_CONFIG$seed + scenario$scenario_id * 1000L + rep_id))
 
 ## ---- Performance metrics ----
 compute_metrics <- function(rep_results_list, truth, method_name, estimand = "NIE") {
-  reps <- lapply(rep_results_list, function(r) r$results[[method_name]])
-  reps <- Filter(function(x) !is.null(x) && isTRUE(x$success), reps)
+
+  ## Keep rep_id alongside each result. The previous version used Filter(),
+  ## which drops failed replicates and discards their identity, so position
+  ## i was not replicate i whenever any replicate failed.
+  keep <- vapply(rep_results_list, function(r) {
+    x <- r$results[[method_name]]
+    !is.null(x) && isTRUE(x$success)
+  }, logical(1))
+  reps    <- lapply(rep_results_list[keep], function(r) r$results[[method_name]])
+  rep_ids <- vapply(rep_results_list[keep], function(r) {
+    v <- r$rep_id
+    if (is.null(v)) NA_integer_ else as.integer(v)
+  }, integer(1))
+
   ns <- length(reps)
   if (ns < 10) return(list(method = method_name, estimand = estimand,
                            n_success = ns, valid = FALSE))
-  tv <- truth[[estimand]]
-  fe <- paste0(estimand, "_est"); fl <- paste0(estimand, "_lo"); fh <- paste0(estimand, "_hi")
+
+  ## Truth: a scalar, or one value per replicate (plasmode cells 13/14).
+  tvec <- truth[[paste0(estimand, "_rep")]]
+  rep_specific <- isTRUE(truth$replicate_specific) && !is.null(tvec)
+  if (rep_specific) {
+    if (anyNA(rep_ids))
+      stop("replicate-specific truth requires rep_id on every result (",
+           method_name, ", ", estimand, ")")
+    if (max(rep_ids) > length(tvec))
+      stop(sprintf("rep_id %d exceeds truth vector length %d (%s, %s)",
+                   max(rep_ids), length(tvec), method_name, estimand))
+    tv <- tvec[rep_ids]                  # aligned BY ID, not by position
+  } else {
+    tv <- rep(truth[[estimand]], ns)     # scalar recycled: identical to before
+  }
+
+  fe <- paste0(estimand, "_est"); fl <- paste0(estimand, "_lo")
+  fh <- paste0(estimand, "_hi")
   est <- sapply(reps, function(x) x[[fe]])
   lo  <- sapply(reps, function(x) x[[fl]])
   hi  <- sapply(reps, function(x) x[[fh]])
   rt  <- sapply(reps, function(x) x$runtime)
-  bias <- mean(est) - tv
-  rb   <- if (abs(tv) > 1e-6) abs(bias / tv) * 100 else NA
+
+  bias <- mean(est - tv)
+  tbar <- mean(tv)
+  rb   <- if (abs(tbar) > 1e-6) abs(bias / tbar) * 100 else NA
   mse  <- mean((est - tv)^2); rmse <- sqrt(mse); ese <- sd(est)
-  vc   <- !is.na(lo) & !is.na(hi)
-  cov  <- if (sum(vc) > 0) mean((lo[vc] <= tv) & (hi[vc] >= tv)) else NA
-  ciw  <- if (sum(vc) > 0) mean(hi[vc] - lo[vc], na.rm = TRUE) else NA
-  list(method = method_name, estimand = estimand, true_val = tv, n_success = ns,
-       bias = bias, rel_bias = rb, mse = mse, rmse = rmse, emp_se = ese,
-       coverage = cov, ci_width = ciw, mean_runtime = mean(rt, na.rm = TRUE),
-       valid = TRUE)
+  mcse <- sd(est - tv) / sqrt(ns)
+
+  vc  <- !is.na(lo) & !is.na(hi)
+  cov <- if (sum(vc) > 0) mean((lo[vc] <= tv[vc]) & (hi[vc] >= tv[vc])) else NA
+  ciw <- if (sum(vc) > 0) mean(hi[vc] - lo[vc], na.rm = TRUE) else NA
+
+  list(method = method_name, estimand = estimand,
+       true_val = tbar,
+       true_sd  = if (rep_specific) sd(tv) else 0,
+       replicate_specific_truth = rep_specific,
+       n_success = ns,
+       bias = bias, rel_bias = rb, mcse = mcse,
+       mse = mse, rmse = rmse, emp_se = ese,
+       coverage = cov, ci_width = ciw,
+       mean_runtime = mean(rt, na.rm = TRUE), valid = TRUE)
 }

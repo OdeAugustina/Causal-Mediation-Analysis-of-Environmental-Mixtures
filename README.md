@@ -1,3 +1,5 @@
+https://doi.org/10.5281/zenodo.22782980
+
 # Causal Mediation Analysis of Environmental Mixtures
 
 Code accompanying *Estimand Alignment and Implementation Sensitivity in Causal Mediation
@@ -254,4 +256,4 @@ Budget accordingly before launching the full grid.
 
 ## Citation
 
-
+https://doi.org/10.5281/zenodo.22782980

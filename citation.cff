@@ -9,6 +9,6 @@ authors:
   orcid: "https://orcid.org/0000-0003-3195-706X"
 title: "Estimand Alignment and Implementation Sensitivity in Causal Mediation Analysis of Environmental Mixtures: Simulation, Plasmode, and Applied Study"
 version: 1.0.0
-doi: 10.5281/zenodo.1234
+doi: https://doi.org/10.5281/zenodo.22782980
 date-released: 2026-09-15
 url: "https://github.com/OdeAugustina/Causal-Mediation-Analysis-of-Environmental-Mixtures"

@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Odediran"
+  given-names: "Augustina"
+  orcid: "https://orcid.org/0009-0007-0482-1622"
+- family-names: "Obeng-Gyasi"
+  given-names: "Emmanuel"
+  orcid: "https://orcid.org/0000-0003-3195-706X"
+title: "Estimand Alignment and Implementation Sensitivity in Causal Mediation Analysis of Environmental Mixtures: Simulation, Plasmode, and Applied Study"
+version: 1.0.0
+doi: 10.5281/zenodo.1234
+date-released: 2026-09-15
+url: "https://github.com/OdeAugustina/Causal-Mediation-Analysis-of-Environmental-Mixtures"

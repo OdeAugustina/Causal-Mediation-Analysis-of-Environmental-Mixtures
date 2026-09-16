@@ -204,18 +204,7 @@ scenarios 1 and 11, then restore `R = 100`.
 
 ---
 
-## Outputs
 
-| Path | Contents |
-| --- | --- |
-| `results/truth/truth_<sid>.rds` | Ground truth per scenario. |
-| `results/raw_scenario_<sid>.rds` | Per-replicate BART and BKMR results. |
-| `results/deepmed/deepmed_<sid>.rds` | DeepMed results per scenario. |
-| `results/errors/scenario_<sid>/` | Per-replicate error messages. |
-| `results/all_metrics.rds` | Aggregated performance metrics. |
-| `results/figures/` | Performance plots. |
-
----
 
 ## Reproducing the figures
 

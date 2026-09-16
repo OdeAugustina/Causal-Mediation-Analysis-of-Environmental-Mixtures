@@ -220,8 +220,6 @@ scenarios 1 and 11, then restore `R = 100`.
 
 ## Reproducing the figures
 
-<!-- TODO: add clean_results_comments_2_3.R to the repository; it is referenced
-     here but not yet committed. -->
 
 `clean_results_comments_2_3.R` reads `all_metrics_fullT.csv` and writes the bias,
 coverage, and interval-width figures together with a three-sheet workbook separating
@@ -265,12 +263,7 @@ Budget accordingly before launching the full grid.
 
 ---
 
-## License
-
-<!-- TODO: add a LICENSE file. Without one, the default is all rights reserved,
-     which prevents reuse even though the repository is public. MIT is the
-     conventional choice for research code and is compatible with causalbkmr. -->
 
 ## Citation
 
-<!-- TODO: add CITATION.cff and the Zenodo DOI once the archive is minted. -->
+

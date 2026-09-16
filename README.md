@@ -20,8 +20,7 @@ All estimands are defined on a common componentwise Q25 → Q75 mixture contrast
 ## Requirements
 
 Developed and run on the UNC Longleaf HPC cluster (SLURM) under **R 4.5.0**.
-The SLURM scripts load `r/4.5.0`; earlier runs under `r/4.4.0` fail because the
-packages are installed against 4.5.0.
+
 
 ### R packages
 

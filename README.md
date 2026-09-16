@@ -256,4 +256,4 @@ Budget accordingly before launching the full grid.
 
 ## Citation
 
-https://doi.org/10.5281/zenodo.22782980
+Augustina O. Odediran, & Obeng-Gyasi, E. (2026). Estimand Alignment and Implementation Sensitivity in Causal Mediation Analysis of Environmental Mixtures: Simulation, Plasmode, and Applied Study (Version v1.0.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.22782980
